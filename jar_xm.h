@@ -1,9 +1,14 @@
-// jar_xm.h - v0.01 - public domain - Joshua Reisenauer, MAR 2016
+// jar_xm.h - public domain
+//
+// INITIAL RELEASE: v0.1 development by Joshua Reisenauer, MAR 2016
+//                  v0.2 changes by m4ntr0n1c, MAR 2021
 //
 // HISTORY:
 //
-//   v0.01  2016-02-22  Setup
-//   v0.1.1 2021-03-07  Fix clipping noise for "bad" xm's (they will always clip), avoid clip noise and just put a ceiling)
+//   v0.1.0 2016-02-22  Setup - public domain - Joshua Reisenauer, MAR 2016
+//   v0.2.1 2021-03-07  Fix clipping noise for "bad" xm's (they will always clip), avoid clip noise and just put a ceiling)
+//   v0.2.2 2021-03-09  Add complete debug solution (raylib.h must be included)
+//   v0.2.3 2021-03-11  Fix tempo, bpm and volume on song stop / start / restart / loop
 //
 //
 // USAGE:
@@ -55,9 +60,10 @@
 #include <stdint.h>
 
 #define JAR_XM_DEBUG 0
-#define JAR_XM_LINEAR_INTERPOLATION 1 // speed increase with decrease in quality
+#define JAR_XM_LINEAR_INTERPOLATION 0 // speed increase with decrease in quality
 #define JAR_XM_DEFENSIVE 1
 #define JAR_XM_RAMPING 1
+#define JAR_XM_RAYLIB 1 // set to 0 to disable the RayLib visualizer extension
 
 // Allow custom memory allocators
 #ifndef JARXM_MALLOC
@@ -337,7 +343,7 @@ extern int __fail[-1];
 #define MODULE_NAME_LENGTH 20
 #define TRACKER_NAME_LENGTH 20
 #define PATTERN_ORDER_TABLE_LENGTH 256
-#define NUM_NOTES 96
+#define NUM_NOTES 96 // from 1 to 96, where 1 = C-0
 #define NUM_ENVELOPE_POINTS 12
 #define MAX_NUM_ROWS 256
 
@@ -538,10 +544,13 @@ struct jar_xm_sample_s {
      jar_xm_module_t module;
      uint32_t rate;
 
-     uint16_t tempo;
+     uint16_t default_tempo; // Number of ticks per row
+     uint16_t default_bpm;
+     float default_global_volume;
+     
+     uint16_t tempo; // Number of ticks per row
      uint16_t bpm;
      float global_volume;
-     float amplification;
 
 #if JAR_XM_RAMPING
      /* How much is a channel final volume allowed to change per
@@ -658,8 +667,8 @@ int jar_xm_create_context_safe(jar_xm_context_t** ctxp, const char* moddata, siz
     mempool += ctx->module.num_channels * sizeof(jar_xm_channel_context_t);
     mempool = ALIGN_PTR(mempool, 16);
 
-    ctx->global_volume = 1.f;
-    ctx->amplification = 1.f; /* XXX: some bad modules may still clip. Find out something better. */
+    ctx->default_global_volume = 1.f;
+    ctx->global_volume = ctx->default_global_volume;
 
 #if JAR_XM_RAMPING
     ctx->volume_ramp = (1.f / 128.f);
@@ -963,8 +972,11 @@ char* jar_xm_load_module(jar_xm_context_t* ctx, const char* moddata, size_t modd
     uint16_t flags = READ_U32(offset + 14);
     mod->frequency_type = (flags & (1 << 0)) ? jar_xm_LINEAR_FREQUENCIES : jar_xm_AMIGA_FREQUENCIES;
 
-    ctx->tempo = READ_U16(offset + 16);
-    ctx->bpm = READ_U16(offset + 18);
+    ctx->default_tempo = READ_U16(offset + 16);
+    ctx->default_bpm = READ_U16(offset + 18);
+
+    ctx->tempo =ctx->default_tempo;
+    ctx->bpm = ctx->default_bpm;
 
     READ_MEMCPY(mod->pattern_table, offset + 20, PATTERN_ORDER_TABLE_LENGTH);
     offset += header_size;
@@ -1287,6 +1299,8 @@ static const float multi_retrig_multiply[] = {
                          || (s)->effect_param == 6 \
                          || ((s)->volume_column >> 4) == 0xB)
 #define NOTE_IS_VALID(n) ((n) > 0 && (n) < 97)
+#define NOTE_OFF 97
+
 
 /* ----- Function definitions ----- */
 
@@ -1464,6 +1478,9 @@ static void jar_xm_post_pattern_change(jar_xm_context_t* ctx) {
     /* Loop if necessary */
     if(ctx->current_table_index >= ctx->module.length) {
         ctx->current_table_index = ctx->module.restart_position;
+        ctx->tempo =ctx->default_tempo; // reset to file default value 
+        ctx->bpm = ctx->default_bpm; // reset to file default value
+        ctx->global_volume = ctx->default_global_volume; // reset to file default value
     }
 }
 
@@ -1580,8 +1597,7 @@ static void jar_xm_update_frequency(jar_xm_context_t* ctx, jar_xm_channel_contex
     ch->step = ch->frequency / ctx->rate;
 }
 
-static void jar_xm_handle_note_and_instrument(jar_xm_context_t* ctx, jar_xm_channel_context_t* ch,
-                                          jar_xm_pattern_slot_t* s) {
+static void jar_xm_handle_note_and_instrument(jar_xm_context_t* ctx, jar_xm_channel_context_t* ch, jar_xm_pattern_slot_t* s) {
     if(s->instrument > 0) {
         if(HAS_TONE_PORTAMENTO(ch->current) && ch->instrument != NULL && ch->sample != NULL) {
             /* Tone portamento in effect, unclear stuff happens */
@@ -1636,7 +1652,7 @@ static void jar_xm_handle_note_and_instrument(jar_xm_context_t* ctx, jar_xm_chan
                 jar_xm_cut_note(ch);
             }
         }
-    } else if(s->note == 97) {
+    } else if(s->note == NOTE_OFF) {
         /* Key Off */
         jar_xm_key_off(ch);
     }
@@ -1883,8 +1899,10 @@ static void jar_xm_handle_note_and_instrument(jar_xm_context_t* ctx, jar_xm_chan
     case 0xF: /* Fxx: Set tempo/BPM */
         if(s->effect_param > 0) {
             if(s->effect_param <= 0x1F) {
+                // First 32 possible values adjust the ticks (goes into tempo)
                 ctx->tempo = s->effect_param;
             } else {
+                //32 and greater values adjust the BPM
                 ctx->bpm = s->effect_param;
             }
         }
@@ -2039,20 +2057,23 @@ static void jar_xm_row(jar_xm_context_t* ctx) {
     jar_xm_pattern_t* cur = ctx->module.patterns + ctx->module.pattern_table[ctx->current_table_index];
     bool in_a_loop = false;
 
-    /* Read notes… */
+    /* Read notes information for all channels into temporary pattern slot */
     for(uint8_t i = 0; i < ctx->module.num_channels; ++i) {
         jar_xm_pattern_slot_t* s = cur->slots + ctx->current_row * ctx->module.num_channels + i;
         jar_xm_channel_context_t* ch = ctx->channels + i;
 
         ch->current = s;
-
+        // If there is no note delay effect (0xED) then...
         if(s->effect_type != 0xE || s->effect_param >> 4 != 0xD) {
+            //********** Process the channel slot information **********
             jar_xm_handle_note_and_instrument(ctx, ch, s);
         } else {
+            // read the note delay information
             ch->note_delay_param = s->effect_param & 0x0F;
         }
 
         if(!in_a_loop && ch->pattern_loop_count > 0) {
+            // clarify if in a loop or not
             in_a_loop = true;
         }
     }
@@ -2062,6 +2083,7 @@ static void jar_xm_row(jar_xm_context_t* ctx) {
         ctx->loop_count = (ctx->row_loop_count[MAX_NUM_ROWS * ctx->current_table_index + ctx->current_row]++);
     }
 
+    /// Move to next row
     ctx->current_row++; /* Since this is an uint8, this line can
                          * increment from 255 to 0, in which case it
                          * is still necessary to go the next
@@ -2147,6 +2169,7 @@ static void jar_xm_envelopes(jar_xm_channel_context_t* ch) {
 
 static void jar_xm_tick(jar_xm_context_t* ctx) {
     if(ctx->current_tick == 0) {
+        // We have processed all ticks and we run the row
         jar_xm_row(ctx);
     }
 
@@ -2167,36 +2190,30 @@ static void jar_xm_tick(jar_xm_context_t* ctx) {
             jar_xm_update_frequency(ctx, ch);
         }
 
+        if(ctx->current_tick > 0) { // THIS CHECK SHOULD NOT BE NECESSARY ***********
         switch(ch->current->volume_column >> 4) {
-
         case 0x6: /* Volume slide down */
-            if(ctx->current_tick == 0) break;
             jar_xm_volume_slide(ch, ch->current->volume_column & 0x0F);
             break;
 
         case 0x7: /* Volume slide up */
-            if(ctx->current_tick == 0) break;
             jar_xm_volume_slide(ch, ch->current->volume_column << 4);
             break;
 
         case 0xB: /* Vibrato */
-            if(ctx->current_tick == 0) break;
             ch->vibrato_in_progress = false;
             jar_xm_vibrato(ctx, ch, ch->vibrato_param, ch->vibrato_ticks++);
             break;
 
         case 0xD: /* Panning slide left */
-            if(ctx->current_tick == 0) break;
             jar_xm_panning_slide(ch, ch->current->volume_column & 0x0F);
             break;
 
         case 0xE: /* Panning slide right */
-            if(ctx->current_tick == 0) break;
             jar_xm_panning_slide(ch, ch->current->volume_column << 4);
             break;
 
         case 0xF: /* Tone portamento */
-            if(ctx->current_tick == 0) break;
             jar_xm_tone_portamento(ctx, ch);
             break;
 
@@ -2204,6 +2221,7 @@ static void jar_xm_tick(jar_xm_context_t* ctx) {
             break;
 
         }
+        };
 
         switch(ch->current->effect_type) {
 
@@ -2391,15 +2409,24 @@ static void jar_xm_tick(jar_xm_context_t* ctx) {
 #endif
     }
 
-    ctx->current_tick++;
+    ctx->current_tick++; // ok so we understand that ticks increment within the row
     if(ctx->current_tick >= ctx->tempo + ctx->extra_ticks) {
+        // This means it reached the end of the row and we reset
         ctx->current_tick = 0;
         ctx->extra_ticks = 0;
     }
 
     /* FT2 manual says number of ticks / second = BPM * 0.4 */
     ctx->remaining_samples_in_tick += (float)ctx->rate / ((float)ctx->bpm * 0.4f);
-}
+
+// THIS SHOULD BE HERE BUT CURRENTLY NOT POSSIBLE *************************       
+//    if(ctx->current_tick == 0) {
+        // We have processed all ticks and we run the row
+//        jar_xm_row(ctx);
+//    };
+
+};
+
 
 static float jar_xm_next_of_sample(jar_xm_channel_context_t* ch) {
     if(ch->instrument == NULL || ch->sample == NULL || ch->sample_position < 0) {
@@ -2503,7 +2530,6 @@ static float jar_xm_next_of_sample(jar_xm_channel_context_t* ch) {
                        (float)ch->frame_count / (float)jar_xm_SAMPLE_RAMPING_POINTS);
     }
 #endif
-
     return endval;
 }
 
@@ -2541,7 +2567,7 @@ static void jar_xm_sample(jar_xm_context_t* ctx, float* left, float* right) {
 #endif
     }
 
-    const float fgvol = ctx->global_volume * ctx->amplification;
+    const float fgvol = ctx->global_volume;
     *left *= fgvol;
     *right *= fgvol;
 //#if JAR_XM_DEBUG
@@ -2684,8 +2710,202 @@ void jar_xm_reset(jar_xm_context_t* ctx)
     ctx->current_row = 0;
     ctx->current_table_index = 0;
     ctx->current_tick = 0;
+    ctx->tempo =ctx->default_tempo; // reset to file default value 
+    ctx->bpm = ctx->default_bpm; // reset to file default value
+    ctx->global_volume = ctx->default_global_volume; // reset to file default value
+
+
 }
 
+void jar_xm_table_jump(jar_xm_context_t* ctx, int table_ptr)
+{
+    ctx->current_row = 0;
+    ctx->current_tick = 0;
+    if(table_ptr > 0 && table_ptr < ctx->module.length) {
+        ctx->current_table_index = table_ptr;
+        ctx->module.restart_position = table_ptr; // The reason to jump is to start a new loop or track
+    } else {
+        ctx->current_table_index = 0;
+        ctx->module.restart_position = 0; // The reason to jump is to start a new loop or track
+        ctx->tempo =ctx->default_tempo; // reset to file default value 
+        ctx->bpm = ctx->default_bpm; // reset to file default value
+        ctx->global_volume = ctx->default_global_volume; // reset to file default value
+    };
+}
+
+
+// TRANSLATE NOTE NUMBER INTO USER VALUE (ie. 1 = C-1, 2 = C#1, 3 = D-1 ... )
+const char* xm_note_chr(int number) {
+    if (number == NOTE_OFF) {
+        return "==";
+    };
+    number = number % 12;
+    switch(number) {
+    case 1: return "C-";
+    case 2: return "C#";
+    case 3: return "D-";
+    case 4: return "D#";
+    case 5: return "E-";
+    case 6: return "F-";
+    case 7: return "F#";
+    case 8: return "G-";
+    case 9: return "G#";
+    case 10: return "A-";
+    case 11: return "A#";
+    case 12: return "B-";
+    };
+    
+};
+
+const char* xm_octave_chr(int number) {
+    if (number == NOTE_OFF) {
+        return "=";
+    };
+
+    int number2 = number - number % 12;
+    int result = floor(number2 / 12) + 1;
+    switch(result) {
+    case 1: return "1";
+    case 2: return "2";
+    case 3: return "3";
+    case 4: return "4";
+    case 5: return "5";
+    case 6: return "6";
+    case 7: return "7";
+    case 8: return "8";
+    default: return "?"; /* UNKNOWN */
+    };
+
+};
+
+// TRANSLATE NOTE EFFECT CODE INTO USER VALUE
+const char* xm_effect_chr(int fx) {
+    switch(fx) {
+    case 0: return "0";  /* ZERO = NO EFFECT */
+    case 1: return "1";  /* 1xx: Portamento up */
+    case 2: return "2";  /* 2xx: Portamento down */
+    case 3: return "3";  /* 3xx: Tone portamento */
+    case 4: return "4";  /* 4xy: Vibrato */
+    case 5: return "5";  /* 5xy: Tone portamento + Volume slide */
+    case 6: return "6";  /* 6xy: Vibrato + Volume slide */
+    case 7: return "7";  /* 7xy: Tremolo */
+    case 8: return "8";  /* 8xx: Set panning */
+    case 9: return "9";  /* 9xx: Sample offset */
+    case 0xA: return "A";/* Axy: Volume slide */
+    case 0xB: return "B";/* Bxx: Position jump */
+    case 0xC: return "C";/* Cxx: Set volume */
+    case 0xD: return "D";/* Dxx: Pattern break */
+    case 0xE: return "E";/* EXy: Extended command */
+    case 0xF: return "F";/* Fxx: Set tempo/BPM */
+    case 16: return "G"; /* Gxx: Set global volume */
+    case 17: return "H"; /* Hxy: Global volume slide */
+    case 21: return "L"; /* Lxx: Set envelope position */
+    case 25: return "P"; /* Pxy: Panning slide */
+    case 27: return "R"; /* Rxy: Multi retrig note */
+    case 29: return "T"; /* Txy: Tremor */
+    case 33: return "X"; /* Xxy: Extra stuff */
+    default: return "?"; /* UNKNOWN */
+    };
+}
+
+#ifdef JAR_XM_RAYLIB
+
+#include "raylib.h" // Need RayLib API calls for the DEBUG display
+
+void jar_xm_debug(jar_xm_context_t *ctx) {
+    int size=40;
+    int x = 0, y = 0;
+
+    // DEBUG VARIABLES
+    y += size; DrawText(TextFormat("CUR TBL = %i", ctx->current_table_index),       x, y, size, WHITE);
+    y += size; DrawText(TextFormat("POS JMP = %d", ctx->position_jump),             x, y, size, WHITE);
+    y += size; DrawText(TextFormat("JMP DST = %i", ctx->jump_dest),                 x, y, size, WHITE);
+    y += size; DrawText(TextFormat("PTN BRK = %d", ctx->pattern_break),             x, y, size, WHITE);
+    y += size; DrawText(TextFormat("CUR TCK = %i", ctx->current_tick),              x, y, size, WHITE);
+    y += size; DrawText(TextFormat("XTR TCK = %i", ctx->extra_ticks),               x, y, size, WHITE);
+    y += size; DrawText(TextFormat("TCK/ROW = %i", ctx->tempo),                     x, y, size, ORANGE);
+    x = size * 12; y = 0;
+    y += size; DrawText(TextFormat("CUR ROW = %i", ctx->current_row),               x, y, size, WHITE);
+    y += size; DrawText(TextFormat("JMP ROW = %i", ctx->jump_row),                  x, y, size, WHITE);
+    y += size; DrawText(TextFormat("ROW LCT = %i", ctx->row_loop_count),            x, y, size, WHITE);
+    y += size; DrawText(TextFormat("LCT     = %i", ctx->loop_count),                x, y, size, WHITE);
+    y += size; DrawText(TextFormat("MAX LCT = %i", ctx->max_loop_count),            x, y, size, WHITE);
+    y += size; DrawText(TextFormat("SPL TCK = %f", ctx->remaining_samples_in_tick), x, y, size, WHITE);
+    y += size; DrawText(TextFormat("GEN SPL = %i", ctx->generated_samples),         x, y, size, WHITE);
+    y += size * 2;
+    
+    x = 0;
+    size=20;
+    // TIMELINE OF MODULE
+    for (int i=0; i < ctx->module.length; i++) {
+        if (i == ctx->jump_dest) {
+            if (ctx->position_jump) {
+                DrawRectangle(i * size * 2, y - size, size * 2, size, GOLD); 
+            } else {
+                DrawRectangle(i * size * 2, y - size, size * 2, size, BROWN);                 
+            };
+        };
+        if (i == ctx->current_table_index) {
+//            DrawText(TextFormat("%02X", ctx->current_tick), i * size * 2, y - size, size, WHITE);
+            DrawRectangle(i * size * 2, y, size * 2, size, RED); 
+            DrawText(TextFormat("%02X", ctx->current_row), i * size * 2, y - size, size, YELLOW);
+        } else {
+            DrawRectangle(i * size * 2, y, size * 2, size, ORANGE); 
+        };
+        DrawText(TextFormat("%02X", ctx->module.pattern_table[i]), i * size * 2, y, size, WHITE);
+    };
+    y += size;
+
+    jar_xm_pattern_t* cur = ctx->module.patterns + ctx->module.pattern_table[ctx->current_table_index];
+
+    /* DISPLAY CURRENTLY PLAYING PATTERN */
+
+    x += 2 * size;
+    for(uint8_t i = 0; i < ctx->module.num_channels; i++) {
+        DrawRectangle(x, y, 8 * size, size, PURPLE);
+        DrawText("N", x, y, size, YELLOW);
+        DrawText("I", x + size * 2, y, size, YELLOW);
+        DrawText("V", x + size * 4, y, size, YELLOW);
+        DrawText("FX", x + size * 6, y, size, YELLOW);
+        x += 9 * size;
+    };
+    x += size;   
+    for (int j=(ctx->current_row - 14); j<(ctx->current_row + 15); j++) {
+        y += size;
+        x = 0;
+        if (j >=0 && j < (cur->num_rows)) {
+            DrawRectangle(x, y, size * 2, size, BROWN); 
+            DrawText(TextFormat("%02X",j), x, y, size, WHITE);
+            x += 2 * size;
+            for(uint8_t i = 0; i < ctx->module.num_channels; i++) {
+                if (j==(ctx->current_row)) {
+                    DrawRectangle(x, y, 8 * size, size, DARKGREEN); 
+                } else {
+                    DrawRectangle(x, y, 8 * size, size, DARKGRAY); 
+                };
+                jar_xm_pattern_slot_t* s = cur->slots + j * ctx->module.num_channels + i;
+                jar_xm_channel_context_t* ch = ctx->channels + i;
+                if (s->note > 0) {DrawText(TextFormat("%s%s", xm_note_chr(s->note), xm_octave_chr(s->note) ), x, y, size, WHITE);} else {DrawText("...", x, y, size, GRAY);};
+                if (s->instrument > 0) {
+                    DrawText(TextFormat("%02X", s->instrument), x + size * 2, y, size, WHITE);
+                    if (s->volume_column == 0) {
+                        DrawText(TextFormat("%02X", 64), x + size * 4, y, size, YELLOW);
+                    };
+                } else {
+                    DrawText("..", x + size * 2, y, size, GRAY);
+                    if (s->volume_column == 0) {
+                        DrawText("..", x + size * 4, y, size, GRAY);
+                    };
+                };
+                if (s->volume_column > 0) {DrawText(TextFormat("%02X", (s->volume_column - 16)), x + size * 4, y, size, WHITE);};
+                if (s->effect_type > 0 || s->effect_param > 0) {DrawText(TextFormat("%s%02X", xm_effect_chr(s->effect_type), s->effect_param), x + size * 6, y, size, WHITE);};
+                x += 9 * size;
+            };
+        };
+    };
+
+}
+#endif // RayLib extension
 
 #endif//end of JAR_XM_IMPLEMENTATION
 //-------------------------------------------------------------------------------
