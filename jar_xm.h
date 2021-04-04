@@ -20,6 +20,7 @@
 //   v0.2.5 2021-03-22  m4ntr0n1c: Minor adjustments
 //   v0.2.6 2021-04-01  m4ntr0n1c: Minor fixes and optimisation
 //   v0.3.0 2021-04-03  m4ntr0n1c: Addition of Stereo sample support, Linear Interpolation and Ramping now addressable options in code
+//   v0.3.1 2021-04-04  m4ntr0n1c: Volume effects column adjustments, sample offset handling adjustments
 //
 // USAGE:
 //
@@ -1377,35 +1378,6 @@ static void jar_xm_handle_note_and_instrument(jar_xm_context_t* ctx, jar_xm_chan
         jar_xm_key_off(ch);
     }
 
-    // Interpret volume functions
-    switch(s->volume_column & 0xF0) {
-    case 0x50: // Checks for volume > 64
-        if(s->volume_column > 80) break;
-    case 0x10: /* Set volume 0-15  */
-    case 0x20: /* Set volume 16-31 */
-    case 0x30: /* Set volume 32-47 */
-    case 0x40: /* Set volume 48-63 */
-        ch->volume = (float)(s->volume_column - 16) / 64.0f;
-        break;
-    case 0x80: /* Fine volume slide down */
-        jar_xm_volume_slide(ch, s->volume_column & 0x0F);
-        break;
-    case 0x90: /* Fine volume slide up */
-        jar_xm_volume_slide(ch, s->volume_column << 4);
-        break;
-    case 0xA0: /* Set vibrato speed */
-        ch->vibrato_param = (ch->vibrato_param & 0x0F) | ((s->volume_column & 0x0F) << 4);
-        break;
-    case 0xC0: /* Set panning */
-        ch->panning = (float)(s->volume_column & 0x0F) / 15.0f;
-        break;
-    case 0xF0: /* Tone portamento */
-        if(s->volume_column & 0x0F) { ch->tone_portamento_param = ((s->volume_column & 0x0F) << 4) | (s->volume_column & 0x0F); }
-        break;
-    default:
-        break;
-    }
-
     // Interpret Effect column
     switch(s->effect_type) {
     case 1: /* 1xx: Portamento up */
@@ -1435,12 +1407,36 @@ static void jar_xm_handle_note_and_instrument(jar_xm_context_t* ctx, jar_xm_chan
         ch->panning = (float)s->effect_param / 255.f;
         break;
     case 9: /* 9xx: Sample offset */
-        if(ch->sample != NULL && NOTE_IS_VALID(s->note)) {
+        if(ch->sample != 0) { //&& NOTE_IS_VALID(s->note)) {
             uint32_t final_offset = s->effect_param << (ch->sample->bits == 16 ? 7 : 8);
-            if(final_offset >= ch->sample->length) { /* Pretend the sample dosen't loop and is done playing */
-                ch->sample_position = -1;
-            } else {
-                ch->sample_position = final_offset;
+            switch (ch->sample->loop_type) {
+            case jar_xm_NO_LOOP:
+                if(final_offset >= ch->sample->length) { /* Pretend the sample dosen't loop and is done playing */
+                    ch->sample_position = -1;
+                } else {
+                    ch->sample_position = final_offset;
+                }
+                break;
+            case jar_xm_FORWARD_LOOP:
+                if (final_offset >= ch->sample->loop_end) {
+                    ch->sample_position -= ch->sample->loop_length;
+                } else if(final_offset >= ch->sample->length) {
+                    ch->sample_position = ch->sample->loop_start;
+                } else {
+                    ch->sample_position = final_offset;
+                }
+                break;
+            case jar_xm_PING_PONG_LOOP:
+                if(final_offset >= ch->sample->loop_end) {
+                    ch->ping = false;
+                    ch->sample_position = (ch->sample->loop_end << 1) - ch->sample_position;
+                } else if(final_offset >= ch->sample->length) {
+                    ch->ping = false;
+                    ch->sample_position -= ch->sample->length - 1;
+                } else {
+                    ch->sample_position = final_offset;
+                };
+                break;
             }
         }
         break;
@@ -1619,8 +1615,8 @@ static void jar_xm_trigger_note(jar_xm_context_t* ctx, jar_xm_channel_context_t*
 
 static void jar_xm_cut_note(jar_xm_channel_context_t* ch) {
     ch->volume = .0f; /* NB: this is not the same as Key Off */
-    ch->curr_left = .0f;
-    ch->curr_right = .0f;
+//    ch->curr_left = .0f;
+//    ch->curr_right = .0f;
 }
 
 static void jar_xm_key_off(jar_xm_channel_context_t* ch) {
@@ -1742,32 +1738,58 @@ static void jar_xm_tick(jar_xm_context_t* ctx) {
             jar_xm_update_frequency(ctx, ch);
         }
 
-        if(ctx->current_tick > 0) { // THIS CHECK SHOULD NOT BE NECESSARY ***********
+        // Effects in volumne column mostly handled on a per tick basis
         switch(ch->current->volume_column & 0xF0) {
-        case 0x60: /* Volume slide down */
+        case 0x50: // Checks for volume = 64
+            if(ch->current->volume_column != 0x50) break;
+        case 0x10: // Set volume 0-15
+        case 0x20: // Set volume 16-32
+        case 0x30: // Set volume 32-48
+        case 0x40: // Set volume 48-64
+            ch->volume = (float)(ch->current->volume_column - 16) / 64.0f;
+            break;
+        case 0x60: // Volume slide down
             jar_xm_volume_slide(ch, ch->current->volume_column & 0x0F);
             break;
-        case 0x70: /* Volume slide up */
+        case 0x70: // Volume slide up
             jar_xm_volume_slide(ch, ch->current->volume_column << 4);
             break;
-        case 0xB0: /* Vibrato */
+        case 0x80: // Fine volume slide down
+            jar_xm_volume_slide(ch, ch->current->volume_column & 0x0F);
+            break;
+        case 0x90: // Fine volume slide up
+            jar_xm_volume_slide(ch, ch->current->volume_column << 4);
+            break;
+        case 0xA0: // Set vibrato speed
+            ch->vibrato_param = (ch->vibrato_param & 0x0F) | ((ch->current->volume_column & 0x0F) << 4);
+            break;
+        case 0xB0: // Vibrato
             ch->vibrato_in_progress = false;
             jar_xm_vibrato(ctx, ch, ch->vibrato_param, ch->vibrato_ticks++);
             break;
-        case 0xD0: /* Panning slide left */
+        case 0xC0: // Set panning
+            if(!ctx->current_tick ) {
+                ch->panning = (float)(ch->current->volume_column & 0x0F) / 15.0f;
+            }
+            break;
+        case 0xD0: // Panning slide left
             jar_xm_panning_slide(ch, ch->current->volume_column & 0x0F);
             break;
-        case 0xE0: /* Panning slide right */
+        case 0xE0: // Panning slide right
             jar_xm_panning_slide(ch, ch->current->volume_column << 4);
             break;
-        case 0xF0: /* Tone portamento */
+        case 0xF0: // Tone portamento
+            if(!ctx->current_tick ) {
+                if(ch->current->volume_column & 0x0F) { ch->tone_portamento_param = ((ch->current->volume_column & 0x0F) << 4) | (ch->current->volume_column & 0x0F); }
+            };
             jar_xm_tone_portamento(ctx, ch);
             break;
         default:
             break;
         }
-        };
 
+        // Only some standard effects handled on a per tick basis
+        // see jar_xm_handle_note_and_instrument for all effects handling on a per row basis
         switch(ch->current->effect_type) {
         case 0: /* 0xy: Arpeggio */
             if(ch->current->effect_param > 0) {
@@ -1829,6 +1851,10 @@ static void jar_xm_tick(jar_xm_context_t* ctx) {
             if(ctx->current_tick == 0) break;
             jar_xm_tremolo(ctx, ch, ch->tremolo_param, ch->tremolo_ticks++);
             break;
+        case 8: /* 8xy: Set panning */
+            break;
+        case 9: /* 9xy: Sample offset */
+            break;
         case 0xA: /* Axy: Volume slide */
             if(ctx->current_tick == 0) break;
             jar_xm_volume_slide(ch, ch->volume_slide_param);
@@ -1858,7 +1884,8 @@ static void jar_xm_tick(jar_xm_context_t* ctx) {
                 break;
             }
             break;
-
+        case 16: /* Fxy: Set tempo/BPM */
+            break;        
         case 17: /* Hxy: Global volume slide */
             if(ctx->current_tick == 0) break;
             if((ch->global_volume_slide_param & 0xF0) && (ch->global_volume_slide_param & 0x0F)) { break; }; /* Invalid state */
@@ -1876,6 +1903,8 @@ static void jar_xm_tick(jar_xm_context_t* ctx) {
         case 20: /* Kxx: Key off */
             if(ctx->current_tick == ch->current->effect_param) {     jar_xm_key_off(ch); };
             break;
+        case 21: /* Lxx: Set envelope position */
+            break;        
         case 25: /* Pxy: Panning slide */
             if(ctx->current_tick == 0) break;
             jar_xm_panning_slide(ch, ch->panning_slide_param);
@@ -1932,11 +1961,12 @@ static void jar_xm_tick(jar_xm_context_t* ctx) {
 
 static void jar_xm_next_of_sample(jar_xm_context_t* ctx, jar_xm_channel_context_t* ch, int previous) {
     jar_xm_module_t* mod = &(ctx->module);
-    
-    ch->curr_left = 0.f;
-    ch->curr_right = 0.f;
 
+//    ch->curr_left = 0.f;
+//    ch->curr_right = 0.f;
     if(ch->instrument == NULL || ch->sample == NULL || ch->sample_position < 0) {
+        ch->curr_left = 0.f;
+        ch->curr_right = 0.f;
         if (mod->ramping) {
             if (ch->frame_count < jar_xm_SAMPLE_RAMPING_POINTS) {
                 if (previous > -1) {
@@ -2104,9 +2134,15 @@ static void jar_xm_mixdown(jar_xm_context_t* ctx, float* left, float* right) {
         *left *= ctx->global_volume;
         *right *= ctx->global_volume;
     };
+
+    // experimental
+//    float counter = (float)ctx->generated_samples * 0.0001f
+//    *left = tan(&left + sin(counter));
+//    *right = tan(&right + cos(counter));
+
     // apply brick wall limiter when audio goes beyond bounderies
     if(*left < -1.0)  {*left = -1.0;}  else if(*left > 1.0)  {*left = 1.0;};
-    if(*right < -1.0) {*right = -1.0;} else if(*right > 1.0) {*right = 1.0;};
+    if(*right < -1.0) {*right = -1.0;} else if(*right > 1.0) {*right = 1.0;};   
 };
 
 void jar_xm_generate_samples(jar_xm_context_t* ctx, float* output, size_t numsamples) {
