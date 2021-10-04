@@ -5,11 +5,10 @@
 // Author: Romain "Artefact2" Dalmaso <artefact2@gmail.com>
 // Contributor: Dan Spencer <dan@atomicpotato.net>
 // Repackaged into jar_xm.h By: Joshua Adam Reisenauer <kd7tck@gmail.com>
-// This program is free software. It comes without any warranty, to the
-// extent permitted by applicable law. You can redistribute it and/or
-// modify it under the terms of the Do What The Fuck You Want To Public
-// License, Version 2, as published by Sam Hocevar. See
-// http://sam.zoy.org/wtfpl/COPYING for more details.
+// 
+// This program is free software.
+// It comes without any warranty, to the extent permitted by applicable law. You can redistribute it and/or modify it
+// under the terms as the Do What The Fuck You Want To Public License applied: published by Sam Hocevar link: http://sam.zoy.org/wtfpl/COPYING for more details.
 //
 // HISTORY:
 //   v0.1.0 2016-02-22  jar_xm.h - development by Joshua Reisenauer, MAR 2016
@@ -21,6 +20,13 @@
 //   v0.2.6 2021-04-01  m4ntr0n1c: Minor fixes and optimisation
 //   v0.3.0 2021-04-03  m4ntr0n1c: Addition of Stereo sample support, Linear Interpolation and Ramping now addressable options in code
 //   v0.3.1 2021-04-04  m4ntr0n1c: Volume effects column adjustments, sample offset handling adjustments
+//   v0.3.2 2021-04-04  m4ntr0n1c: Experimental; Compressor-Expander, more hooks _ended up a bad idea_
+//   v0.3.3 2021-06-06  m4ntr0n1c: Changed/Added; Pattern_jump, Pattern_jump_immediate, other minor tweaks
+//   v0.3.4 2021-06-09  m4ntr0n1c: Implemented channel mixer and api calls
+//   v0.3.5 2021-06-09  m4ntr0n1c: Effects Implementation: Panbello and Note Off
+//   v0.3.6 2021-06-13  m4ntr0n1c: Debug Display: Reduced performance hit & Improved usability
+//   v0.3.7 2021-10-03  m4ntr0n1c: Latest fixes applied (taken from the Artefact2 core sources)
+//                                  ie. multi-retrig, vibrato, note retrigger volume, volume panning cache, envelope speed, ghost notes
 //
 // USAGE:
 //
@@ -60,7 +66,7 @@
 
 #define JAR_XM_DEBUG 0
 #define JAR_XM_DEFENSIVE 1
-#define JAR_XM_RAYLIB 1 // set to 0 to disable the RayLib visualizer extension
+#define JAR_XM_RAYLIB 0 // set to 0 to disable the RayLib visualizer extension
 
 // Allow custom memory allocators
 #ifndef JARXM_MALLOC
@@ -70,7 +76,7 @@
     #define JARXM_FREE(p)       free(p)
 #endif
 
-//-------------------------------------------------------------------------------
+//---- STORAGE SPACE FOR LOADED MODULE
 struct jar_xm_context_s;
 typedef struct jar_xm_context_s jar_xm_context_t;
 
@@ -119,13 +125,24 @@ void jar_xm_free_context(jar_xm_context_t* ctx);
 // * @param numsamples number of samples to generate
 void jar_xm_generate_samples(jar_xm_context_t* ctx, float* output, size_t numsamples);
 
+//** Play the module, resample from float to 24 bit, and put the sound samples in an output buffer.
+// * @param output buffer of 2*numsamples elements (A left and right value for each sample)
+// * @param numsamples number of samples to generate
+void jar_xm_generate_samples_24bit(jar_xm_context_t* ctx, short* output, size_t numsamples) {
+    float* musicBuffer = JARXM_MALLOC((2*numsamples)*sizeof(float));
+    jar_xm_generate_samples(ctx, musicBuffer, numsamples);
+    if(output){
+        for(int x=0;x<2*numsamples;x++) output[x] = (musicBuffer[x] * 8388607.0f); // scale sample to signed 24 bit value as int
+    }
+    JARXM_FREE(musicBuffer);
+}
+
 //** Play the module, resample from float to 16 bit, and put the sound samples in an output buffer.
 // * @param output buffer of 2*numsamples elements (A left and right value for each sample)
 // * @param numsamples number of samples to generate
 void jar_xm_generate_samples_16bit(jar_xm_context_t* ctx, short* output, size_t numsamples) {
     float* musicBuffer = JARXM_MALLOC((2*numsamples)*sizeof(float));
     jar_xm_generate_samples(ctx, musicBuffer, numsamples);
-
     if(output){
         for(int x=0;x<2*numsamples;x++) output[x] = (musicBuffer[x] * 32767.0f); // scale sample to signed small int
     }
@@ -138,9 +155,8 @@ void jar_xm_generate_samples_16bit(jar_xm_context_t* ctx, short* output, size_t 
 void jar_xm_generate_samples_8bit(jar_xm_context_t* ctx, char* output, size_t numsamples) {
     float* musicBuffer = JARXM_MALLOC((2*numsamples)*sizeof(float));
     jar_xm_generate_samples(ctx, musicBuffer, numsamples);
-
     if(output){
-        for(int x=0;x<2*numsamples;x++) output[x] = (musicBuffer[x] * 127.0f); // scale sample to signed 8 bit
+        for(int x=0;x<2*numsamples;x++) output[x] = ((musicBuffer[x] + 1.0f) * 127.5f); // scale sample to unsigned 8 bit
     }
     JARXM_FREE(musicBuffer);
 }
@@ -231,6 +247,7 @@ uint64_t jar_xm_get_remaining_samples(jar_xm_context_t* ctx);
 #include <stdlib.h>
 #include <limits.h>
 #include <string.h>
+#include <inttypes.h>
 
 #if JAR_XM_DEBUG            //JAR_XM_DEBUG defined as 0
 #include <stdio.h>
@@ -255,6 +272,7 @@ extern int __fail[-1];
 #define TRACKER_NAME_LENGTH 20
 #define PATTERN_ORDER_TABLE_LENGTH 256
 #define NUM_NOTES 96 // from 1 to 96, where 1 = C-0
+#define NUM_CHANNELS 32 // standard is 32, but Mod Plug Tracker allows up to 128
 #define NUM_ENVELOPE_POINTS 12 // to be verified if 12 is the max
 #define MAX_NUM_ROWS 256
 
@@ -364,6 +382,7 @@ struct jar_xm_sample_s {
      uint16_t num_instruments;
      uint16_t linear_interpolation;
      uint16_t ramping;     
+     uint16_t comp_exp;
      jar_xm_frequency_type_t frequency_type;
      uint8_t pattern_table[PATTERN_ORDER_TABLE_LENGTH];
 
@@ -435,8 +454,7 @@ struct jar_xm_sample_s {
      bool muted;
 
      //* These values are updated at the end of each tick, to save a couple of float operations on every generated sample.
-     float target_panning;
-     float target_volume;
+     float target_volume[2];
 
      unsigned long frame_count;
      float end_of_previous_sample_left[jar_xm_SAMPLE_RAMPING_POINTS];
@@ -445,7 +463,7 @@ struct jar_xm_sample_s {
      float curr_right;
 
      float actual_panning;
-     float actual_volume;
+     float actual_volume[2];
  };
  typedef struct jar_xm_channel_context_s jar_xm_channel_context_t;
 
@@ -461,9 +479,9 @@ struct jar_xm_sample_s {
      uint16_t tempo; // Number of ticks per row
      uint16_t bpm;
      float global_volume;
+     float channel_volume[NUM_CHANNELS];
 
      float volume_ramp; /* How much is a channel final volume allowed to change per sample; this is used to avoid abrubt volume changes which manifest as "clicks" in the generated sound. */
-     float panning_ramp; /* Same for panning. */
 
      uint8_t current_table_index;
      uint8_t current_row;
@@ -484,6 +502,25 @@ struct jar_xm_sample_s {
 
      jar_xm_channel_context_t* channels;
 };
+
+// Compressor / expander
+const float comp_TBL[2][6] = {{0.0, 0.25, 0.5, 0.75, 0.90, 1.0}, {1.0, 2.0, 4.5, 2.8, 1.5, 1.0}};
+const int COMP_TBL_ENTRIES = 6;
+
+float jar_xm_compress_expand (float chan) {
+    int lo = 0, hi = 0;
+    for (int j=0;j<=(COMP_TBL_ENTRIES-1);j++) {
+        if (comp_TBL[0][j] <= chan) { lo = j;};
+        if (comp_TBL[0][j] >= chan) { hi = j;};
+    };
+    float a = chan - comp_TBL[0][lo];
+    float c = comp_TBL[0][hi] - chan;
+        
+    float a1= comp_TBL[1][lo];
+    float c1= comp_TBL[1][hi];
+    return sqrt((c * c * c1 * c1 + a * a * a1 * a1) * chan * chan) * .333;
+};
+
 
 #if JAR_XM_DEFENSIVE
 
@@ -561,9 +598,10 @@ int jar_xm_create_context_safe(jar_xm_context_t** ctxp, const char* moddata, siz
     ctx->global_volume = ctx->default_global_volume;
 
     ctx->volume_ramp = (1.f / 128.f);
-    ctx->panning_ramp = (1.f / 128.f);
 
     for(uint8_t i = 0; i < ctx->module.num_channels; ++i) {
+        ctx->channel_volume[i] = 1.0f; // set to full
+
         jar_xm_channel_context_t *ch = ctx->channels + i;
         ch->ping = true;
         ch->vibrato_waveform = jar_xm_SINE_WAVEFORM;
@@ -572,8 +610,8 @@ int jar_xm_create_context_safe(jar_xm_context_t** ctxp, const char* moddata, siz
         ch->tremolo_waveform_retrigger = true;
         ch->volume = ch->volume_envelope_volume = ch->fadeout_volume = 1.0f;
         ch->panning = ch->panning_envelope_panning = .5f;
-        ch->actual_volume = .0f;
-        ch->actual_panning = .5f;
+        ch->actual_volume[0] = .0f;
+        ch->actual_volume[1] = .0f;
     }
 
     mempool = ALIGN_PTR(mempool, 16);
@@ -670,7 +708,27 @@ uint64_t jar_xm_get_latest_trigger_of_channel(jar_xm_context_t *ctx, uint16_t ch
     return ctx->channels[chn - 1].latest_trigger;
 }
 
-//* .xm files are little-endian. (XXX: Are they really?)
+bool jar_xm_is_channel_active(jar_xm_context_t* ctx, uint16_t chn) {
+	jar_xm_channel_context_t* ch = ctx->channels + (chn - 1);
+	return ch->instrument != NULL && ch->sample != NULL && ch->sample_position >= 0;
+}
+float jar_xm_get_frequency_of_channel(jar_xm_context_t* ctx, uint16_t chn) {
+	return ctx->channels[chn - 1].frequency;
+}
+
+float jar_xm_get_volume_of_channel(jar_xm_context_t* ctx, uint16_t chn) {
+	return ctx->channels[chn - 1].volume * ctx->global_volume;
+}
+
+float jar_xm_get_panning_of_channel(jar_xm_context_t* ctx, uint16_t chn) {
+	return ctx->channels[chn - 1].panning;
+}
+
+uint16_t jar_xm_get_instrument_of_channel(jar_xm_context_t* ctx, uint16_t chn) {
+	jar_xm_channel_context_t* ch = ctx->channels + (chn - 1);
+	if(ch->instrument == NULL) return 0;
+	return 1 + (ch->instrument - ctx->module.instruments);
+}
 
 //* Bound reader macros.
 //* If we attempt to read the buffer out-of-bounds, pretend that the buffer is infinitely padded with zeroes.
@@ -800,6 +858,7 @@ char* jar_xm_load_module(jar_xm_context_t* ctx, const char* moddata, size_t modd
     mod->patterns = (jar_xm_pattern_t*)mempool;
     mod->linear_interpolation = 0; // Linear interpolation can be set after loading
     mod->ramping = 1; // ramping can be set after loading
+    mod->comp_exp = 0; // use compressor - expander (experimental)
     mempool += mod->num_patterns * sizeof(jar_xm_pattern_t);
     mempool = ALIGN_PTR(mempool, 16);
     mod->instruments = (jar_xm_instrument_t*)mempool;
@@ -1049,7 +1108,7 @@ char* jar_xm_load_module(jar_xm_context_t* ctx, const char* moddata, size_t modd
 //THE FOLLOWING IS FOR PLAYING
 static float jar_xm_waveform(jar_xm_waveform_type_t, uint8_t);
 static void jar_xm_autovibrato(jar_xm_context_t*, jar_xm_channel_context_t*);
-static void jar_xm_vibrato(jar_xm_context_t*, jar_xm_channel_context_t*, uint8_t, uint16_t);
+static void jar_xm_vibrato(jar_xm_context_t*, jar_xm_channel_context_t*, uint8_t);
 static void jar_xm_tremolo(jar_xm_context_t*, jar_xm_channel_context_t*, uint8_t, uint16_t);
 static void jar_xm_arpeggio(jar_xm_context_t*, jar_xm_channel_context_t*, uint8_t, uint16_t);
 static void jar_xm_tone_portamento(jar_xm_context_t*, jar_xm_channel_context_t*);
@@ -1066,7 +1125,7 @@ static float jar_xm_linear_frequency(float);
 static float jar_xm_amiga_period(float);
 static float jar_xm_amiga_frequency(float);
 static float jar_xm_period(jar_xm_context_t*, float);
-static float jar_xm_frequency(jar_xm_context_t*, float, float);
+static float jar_xm_frequency(jar_xm_context_t*, float, float, float);
 static void jar_xm_update_frequency(jar_xm_context_t*, jar_xm_channel_context_t*);
 
 static void jar_xm_handle_note_and_instrument(jar_xm_context_t*, jar_xm_channel_context_t*, jar_xm_pattern_slot_t*);
@@ -1081,10 +1140,6 @@ static void jar_xm_tick(jar_xm_context_t*);
 static void jar_xm_next_of_sample(jar_xm_context_t*, jar_xm_channel_context_t*, int);
 static void jar_xm_mixdown(jar_xm_context_t*, float*, float*);
 
-#define jar_xm_TRIGGER_KEEP_VOLUME (1 << 0)
-#define jar_xm_TRIGGER_KEEP_PERIOD (1 << 1)
-#define jar_xm_TRIGGER_KEEP_SAMPLE_POSITION (1 << 2)
-
                                             // C-2, C#2, D-2, D#2, E-2, F-2, F#2, G-2, G#2, A-2, A#2, B-2, C-3
 static const uint16_t amiga_frequencies[] = { 1712, 1616, 1525, 1440, 1357, 1281, 1209, 1141, 1077, 1017,  961,  907, 856 };
 
@@ -1094,43 +1149,25 @@ static const float multi_retrig_add[] = { 0.f, -1.f, -2.f, -4.f, -8.f, -16.f, 0.
                                             // 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, a, b, c, d, e, f
 static const float multi_retrig_multiply[] = { 1.f, 1.f, 1.f, 1.f, 1.f, 1.f, .6666667f, .5f, 1.f, 1.f, 1.f, 1.f, 1.f, 1.f, 1.5f, 2.f };
 
-#define jar_xm_CLAMP_UP1F(vol, limit) do {            \
-        if((vol) > (limit)) (vol) = (limit);    \
-    } while(0)
+#define jar_xm_TRIGGER_KEEP_VOLUME (1 << 0)
+#define jar_xm_TRIGGER_KEEP_PERIOD (1 << 1)
+#define jar_xm_TRIGGER_KEEP_SAMPLE_POSITION (1 << 2)
+#define jar_xm_TRIGGER_KEEP_ENVELOPE (1 <<3)
+
+#define jar_xm_CLAMP_UP1F(vol, limit) do { if((vol) > (limit)) (vol) = (limit); } while(0)
 #define jar_xm_CLAMP_UP(vol) jar_xm_CLAMP_UP1F((vol), 1.f)
-
-#define jar_xm_CLAMP_DOWN1F(vol, limit) do {        \
-        if((vol) < (limit)) (vol) = (limit);    \
-    } while(0)
+#define jar_xm_CLAMP_DOWN1F(vol, limit) do { if((vol) < (limit)) (vol) = (limit); } while(0)
 #define jar_xm_CLAMP_DOWN(vol) jar_xm_CLAMP_DOWN1F((vol), .0f)
-
-#define jar_xm_CLAMP2F(vol, up, down) do {            \
-        if((vol) > (up)) (vol) = (up);            \
-        else if((vol) < (down)) (vol) = (down); \
-    } while(0)
+#define jar_xm_CLAMP2F(vol, up, down) do { if((vol) > (up)) (vol) = (up); else if((vol) < (down)) (vol) = (down); } while(0)
 #define jar_xm_CLAMP(vol) jar_xm_CLAMP2F((vol), 1.f, .0f)
-
-#define jar_xm_SLIDE_TOWARDS(val, goal, incr) do {        \
-        if((val) > (goal)) {                        \
-            (val) -= (incr);                        \
-            jar_xm_CLAMP_DOWN1F((val), (goal));            \
-        } else if((val) < (goal)) {                    \
-            (val) += (incr);                        \
-            jar_xm_CLAMP_UP1F((val), (goal));            \
-        }                                            \
-    } while(0)
-
+#define jar_xm_SLIDE_TOWARDS(val, goal, incr) do { if((val) > (goal)) { (val) -= (incr); jar_xm_CLAMP_DOWN1F((val), (goal));} else if((val) < (goal)) {(val) += (incr); jar_xm_CLAMP_UP1F((val), (goal));} } while(0)
 #define jar_xm_LERP(u, v, t) ((u) + (t) * ((v) - (u)))
 #define jar_xm_INVERSE_LERP(u, v, lerp) (((lerp) - (u)) / ((v) - (u)))
 
-#define HAS_TONE_PORTAMENTO(s) ((s)->effect_type == 3 \
-                                 || (s)->effect_type == 5 \
-                                 || ((s)->volume_column >> 4) == 0xF)
-#define HAS_ARPEGGIO(s) ((s)->effect_type == 0 \
-                          && (s)->effect_param != 0)
-#define HAS_VIBRATO(s) ((s)->effect_type == 4 \
-                         || (s)->effect_param == 6 \
-                         || ((s)->volume_column >> 4) == 0xB)
+#define HAS_TONE_PORTAMENTO(s) ((s)->effect_type == 3 || (s)->effect_type == 5 || ((s)->volume_column >> 4) == 0xF)
+#define HAS_ARPEGGIO(s) ((s)->effect_type == 0 && (s)->effect_param != 0)
+#define HAS_VIBRATO(s) ((s)->effect_type == 4 || (s)->effect_type == 6 || ((s)->volume_column >> 4) == 0xB)
+
 #define NOTE_IS_VALID(n) ((n) > 0 && (n) < 97)
 #define NOTE_OFF 97
 
@@ -1156,18 +1193,21 @@ static float jar_xm_waveform(jar_xm_waveform_type_t waveform, uint8_t step) {
 }
 
 static void jar_xm_autovibrato(jar_xm_context_t* ctx, jar_xm_channel_context_t* ch) {
-    if(ch->instrument == NULL || ch->instrument->vibrato_depth == 0) return;
-    jar_xm_instrument_t* instr = ch->instrument;
-    float sweep = 1.f;
-    if(ch->autovibrato_ticks < instr->vibrato_sweep) { sweep = jar_xm_LERP(0.f, 1.f, (float)ch->autovibrato_ticks / (float)instr->vibrato_sweep); }
-    unsigned int step = ((ch->autovibrato_ticks++) * instr->vibrato_rate) >> 2;
-    ch->autovibrato_note_offset = .25f * jar_xm_waveform(instr->vibrato_type, step) * (float)instr->vibrato_depth / (float)0xF * sweep;
-    jar_xm_update_frequency(ctx, ch);
+	if(ch->instrument == NULL || ch->instrument->vibrato_depth == 0) {
+		if (ch->autovibrato_note_offset){ ch->autovibrato_note_offset = 0.f; jar_xm_update_frequency(ctx, ch); }
+		return;
+	}
+	jar_xm_instrument_t* instr = ch->instrument;
+	float sweep = 1.f;
+	if(ch->autovibrato_ticks < instr->vibrato_sweep) sweep = jar_xm_LERP(0.f, 1.f, (float)ch->autovibrato_ticks / (float)instr->vibrato_sweep);
+	unsigned int step = ((ch->autovibrato_ticks++) * instr->vibrato_rate) >> 2;
+	ch->autovibrato_note_offset = .25f * jar_xm_waveform(instr->vibrato_type, step) * (float)instr->vibrato_depth / (float)0xF * sweep;
+	jar_xm_update_frequency(ctx, ch);
 }
 
-static void jar_xm_vibrato(jar_xm_context_t* ctx, jar_xm_channel_context_t* ch, uint8_t param, uint16_t pos) {
-    unsigned int step = pos * (param >> 4);
-    ch->vibrato_note_offset = 2.f * jar_xm_waveform(ch->vibrato_waveform, step) * (float)(param & 0x0F) / (float)0xF;
+static void jar_xm_vibrato(jar_xm_context_t* ctx, jar_xm_channel_context_t* ch, uint8_t param) {
+    ch->vibrato_ticks += (param >> 4);
+    ch->vibrato_note_offset = -2.f * jar_xm_waveform(ch->vibrato_waveform, ch->vibrato_ticks) * (float)(param & 0x0F) / (float)0xF;
     jar_xm_update_frequency(ctx, ch);
 }
 
@@ -1239,7 +1279,10 @@ static void jar_xm_post_pattern_change(jar_xm_context_t* ctx) {
         ctx->tempo =ctx->default_tempo; // reset to file default value 
         ctx->bpm = ctx->default_bpm; // reset to file default value
         ctx->global_volume = ctx->default_global_volume; // reset to file default value
-    }
+    } else if (ctx->jump_dest) {
+        ctx->current_table_index = ctx->jump_dest;
+        ctx->jump_dest = 0;
+    };
 }
 
 static float jar_xm_linear_period(float note) {
@@ -1266,8 +1309,8 @@ static float jar_xm_amiga_period(float note) {
 }
 
 static float jar_xm_amiga_frequency(float period) {
-    if(period == .0f) return .0f;
-    return 7093789.2f / (period * 2.f); /* This is the PAL value. (we could use the NTSC value also) */
+    if(period == .0f) return .0f; // avoid division by zero
+    return 7093789.2f / (period * 2.f); // This is the PAL clock. (we could use the NTSC 7159090.75f clock also) and this will alter the pitch slightly
 }
 
 static float jar_xm_period(jar_xm_context_t* ctx, float note) {
@@ -1280,12 +1323,12 @@ static float jar_xm_period(jar_xm_context_t* ctx, float note) {
     return .0f;
 }
 
-static float jar_xm_frequency(jar_xm_context_t* ctx, float period, float note_offset) {
+static float jar_xm_frequency(jar_xm_context_t* ctx, float period, float note_offset, float period_offset) {
     switch(ctx->module.frequency_type) {
     case jar_xm_LINEAR_FREQUENCIES:
-        return jar_xm_linear_frequency(period - 64.f * note_offset);
+        return jar_xm_linear_frequency(period - 64.f * note_offset - 16.f * period_offset);
     case jar_xm_AMIGA_FREQUENCIES:
-        if(note_offset == 0) { return jar_xm_amiga_frequency(period); };
+        if(note_offset == 0) { return jar_xm_amiga_frequency(period + 16.f * period_offset); }
         int8_t octave;
         float  note;
         uint16_t p1, p2;
@@ -1317,14 +1360,14 @@ static float jar_xm_frequency(jar_xm_context_t* ctx, float period, float note_of
         }
         if(JAR_XM_DEBUG && (p1 < period || p2 > period)) { DEBUG("%i <= %f <= %i should hold but doesn't, this is a bug", p2, period, p1); }
         note = 12.f * (octave + 2) + a + jar_xm_INVERSE_LERP(p1, p2, period);
-        return jar_xm_amiga_frequency(jar_xm_amiga_period(note + note_offset));
+        return jar_xm_amiga_frequency(jar_xm_amiga_period(note + note_offset + 16.f * period_offset));
     }
 
     return .0f;
 }
 
 static void jar_xm_update_frequency(jar_xm_context_t* ctx, jar_xm_channel_context_t* ch) {
-    ch->frequency = jar_xm_frequency( ctx, ch->period, (ch->arp_note_offset > 0 ? ch->arp_note_offset : (  ch->vibrato_note_offset + ch->autovibrato_note_offset ))  );
+    ch->frequency = jar_xm_frequency( ctx, ch->period, ch->arp_note_offset, ch->vibrato_note_offset + ch->autovibrato_note_offset);
     ch->step = ch->frequency / ctx->rate;
 }
 
@@ -1333,16 +1376,15 @@ static void jar_xm_handle_note_and_instrument(jar_xm_context_t* ctx, jar_xm_chan
     if(s->instrument > 0) {
         if(HAS_TONE_PORTAMENTO(ch->current) && ch->instrument != NULL && ch->sample != NULL) {  /* Tone portamento in effect */
             jar_xm_trigger_note(ctx, ch, jar_xm_TRIGGER_KEEP_PERIOD | jar_xm_TRIGGER_KEEP_SAMPLE_POSITION);
+		} else if(s->note == 0 && ch->sample != NULL) {
+			/* Ghost instrument, trigger note. Sample position is kept, but envelopes are reset */
+			jar_xm_trigger_note(ctx, ch, jar_xm_TRIGGER_KEEP_SAMPLE_POSITION);            
         } else if(s->instrument > ctx->module.num_instruments) {    /* Invalid instrument, Cut current note */
             jar_xm_cut_note(ch);
             ch->instrument = NULL;
             ch->sample = NULL;
         } else {
             ch->instrument = ctx->module.instruments + (s->instrument - 1);
-            if(s->note == 0 && ch->sample != NULL) {  /* Ghost instrument, trigger note */
-                /* Sample position is kept, but envelopes are reset */
-                jar_xm_trigger_note(ctx, ch, jar_xm_TRIGGER_KEEP_SAMPLE_POSITION);
-            }
         }
     }
 
@@ -1447,6 +1489,7 @@ static void jar_xm_handle_note_and_instrument(jar_xm_context_t* ctx, jar_xm_chan
         if(s->effect_param < ctx->module.length) {
             ctx->position_jump = true;
             ctx->jump_dest = s->effect_param;
+    		ctx->jump_row = 0;
         }
         break;
     case 0xC: /* Cxx: Set volume */
@@ -1466,6 +1509,8 @@ static void jar_xm_handle_note_and_instrument(jar_xm_context_t* ctx, jar_xm_chan
         case 2: /* E2y: Fine portamento down */
             if(s->effect_param & 0x0F) {    ch->fine_portamento_down_param = s->effect_param & 0x0F; }
             jar_xm_pitch_slide(ctx, ch, ch->fine_portamento_down_param);
+            break;
+        case 3: /* E3y: Glissando Control */
             break;
         case 4: /* E4y: Set vibrato control */
             ch->vibrato_waveform = s->effect_param & 3;
@@ -1522,6 +1567,8 @@ static void jar_xm_handle_note_and_instrument(jar_xm_context_t* ctx, jar_xm_chan
         case 0xE: /* EEy: Pattern delay */
             ctx->extra_ticks = (ch->current->effect_param & 0x0F) * ctx->tempo;
             break;
+        case 0xF: /* EFy: Set Active Macro (modplug hack) */
+            break;
         default:
             break;
         }
@@ -1542,6 +1589,8 @@ static void jar_xm_handle_note_and_instrument(jar_xm_context_t* ctx, jar_xm_chan
         break;
     case 17: /* Hxy: Global volume slide */
         if(s->effect_param > 0) {    ch->global_volume_slide_param = s->effect_param; }
+        break;
+    case 20: /* Kxx: Key Off (xx = number of ticks) */
         break;
     case 21: /* Lxx: Set envelope position */
         ch->volume_envelope_frame_count = s->effect_param;
@@ -1572,9 +1621,13 @@ static void jar_xm_handle_note_and_instrument(jar_xm_context_t* ctx, jar_xm_chan
             if(s->effect_param & 0x0F) {   ch->extra_fine_portamento_down_param = s->effect_param & 0x0F; }
             jar_xm_pitch_slide(ctx, ch, ch->extra_fine_portamento_down_param);
             break;
+        case 5: /* X5y: Set the waveform of future Panbrello effects (modplug hack) */
+            break;
         default:
             break;
         }
+        break;
+    case 34: /* Yxy: Panbrello (panning) (x = speed, y = depth) */
         break;
     default:
         break;
@@ -1593,10 +1646,13 @@ static void jar_xm_trigger_note(jar_xm_context_t* ctx, jar_xm_channel_context_t*
         };
     };
     ch->panning = ch->sample->panning;
-    ch->sustained = true;
-    ch->fadeout_volume = ch->volume_envelope_volume = 1.0f;
-    ch->panning_envelope_panning = .5f;
-    ch->volume_envelope_frame_count = ch->panning_envelope_frame_count = 0;
+
+    if (!(flags & jar_xm_TRIGGER_KEEP_ENVELOPE)) {
+        ch->sustained = true;
+        ch->fadeout_volume = ch->volume_envelope_volume = 1.0f;
+        ch->panning_envelope_panning = .5f;
+        ch->volume_envelope_frame_count = ch->panning_envelope_frame_count = 0;
+    }
     ch->vibrato_note_offset = 0.f;
     ch->tremolo_volume = 0.f;
     ch->tremor_on = false;
@@ -1669,7 +1725,12 @@ static void jar_xm_row(jar_xm_context_t* ctx) {
     /// Move to next row
     ctx->current_row++; /* uint8 warning: can increment from 255 to 0, in which case it is still necessary to go the next pattern. */
     if (!ctx->position_jump && !ctx->pattern_break && (ctx->current_row >= cur->num_rows || ctx->current_row == 0)) {
-        ctx->current_table_index++;
+        if (!ctx->jump_dest) {
+            ctx->current_table_index++;
+        } else {
+            ctx->current_table_index = ctx->jump_dest;
+            ctx->jump_dest = 0;
+        };
         ctx->current_row = ctx->jump_row; /* This will be 0 most of the time, except when E60 is used */
         ctx->jump_row = 0;
         jar_xm_post_pattern_change(ctx);
@@ -1706,7 +1767,7 @@ static void jar_xm_envelopes(jar_xm_channel_context_t *ch) {
     if(ch->instrument != NULL) {
         if(ch->instrument->volume_envelope.enabled) {
             if(!ch->sustained) {
-                ch->fadeout_volume -= (float)ch->instrument->volume_fadeout / 65536.f;
+                ch->fadeout_volume -= (float)ch->instrument->volume_fadeout / 32768.f;
                 jar_xm_CLAMP_DOWN(ch->fadeout_volume);
             };
             jar_xm_envelope_tick(ch, &(ch->instrument->volume_envelope), &(ch->volume_envelope_frame_count), &(ch->volume_envelope_volume));
@@ -1765,7 +1826,7 @@ static void jar_xm_tick(jar_xm_context_t* ctx) {
             break;
         case 0xB0: // Vibrato
             ch->vibrato_in_progress = false;
-            jar_xm_vibrato(ctx, ch, ch->vibrato_param, ch->vibrato_ticks++);
+            jar_xm_vibrato(ctx, ch, ch->vibrato_param);
             break;
         case 0xC0: // Set panning
             if(!ctx->current_tick ) {
@@ -1834,7 +1895,7 @@ static void jar_xm_tick(jar_xm_context_t* ctx) {
         case 4: /* 4xy: Vibrato */
             if(ctx->current_tick == 0) break;
             ch->vibrato_in_progress = true;
-            jar_xm_vibrato(ctx, ch, ch->vibrato_param, ch->vibrato_ticks++);
+            jar_xm_vibrato(ctx, ch, ch->vibrato_param);
             break;
         case 5: /* 5xy: Tone portamento + Volume slide */
             if(ctx->current_tick == 0) break;
@@ -1844,7 +1905,7 @@ static void jar_xm_tick(jar_xm_context_t* ctx) {
         case 6: /* 6xy: Vibrato + Volume slide */
             if(ctx->current_tick == 0) break;
             ch->vibrato_in_progress = true;
-            jar_xm_vibrato(ctx, ch, ch->vibrato_param, ch->vibrato_ticks++);
+            jar_xm_vibrato(ctx, ch, ch->vibrato_param);
             jar_xm_volume_slide(ch, ch->volume_slide_param);
             break;
         case 7: /* 7xy: Tremolo */
@@ -1864,7 +1925,7 @@ static void jar_xm_tick(jar_xm_context_t* ctx) {
             case 0x9: /* E9y: Retrigger note */
                 if(ctx->current_tick != 0 && ch->current->effect_param & 0x0F) {
                     if(!(ctx->current_tick % (ch->current->effect_param & 0x0F))) {
-                        jar_xm_trigger_note(ctx, ch, 0);
+                        jar_xm_trigger_note(ctx, ch, jar_xm_TRIGGER_KEEP_VOLUME);
                         jar_xm_envelopes(ch);
                     }
                 }
@@ -1913,12 +1974,14 @@ static void jar_xm_tick(jar_xm_context_t* ctx) {
             if(ctx->current_tick == 0) break;
             if(((ch->multi_retrig_param) & 0x0F) == 0) break;
             if((ctx->current_tick % (ch->multi_retrig_param & 0x0F)) == 0) {
-                float v = ch->volume * multi_retrig_multiply[ch->multi_retrig_param >> 4]
-                    + multi_retrig_add[ch->multi_retrig_param >> 4];
-                jar_xm_CLAMP(v);
-                jar_xm_trigger_note(ctx, ch, 0);
-                ch->volume = v;
-            };
+                jar_xm_trigger_note(ctx, ch, jar_xm_TRIGGER_KEEP_VOLUME | jar_xm_TRIGGER_KEEP_ENVELOPE);
+                /* Rxy doesn't affect volume if there's a command in the volume column, or if the instrument has a volume envelope. */
+                if (!ch->current->volume_column && !ch->instrument->volume_envelope.enabled) {
+                    float v = ch->volume * multi_retrig_multiply[ch->multi_retrig_param >> 4] + multi_retrig_add[ch->multi_retrig_param >> 4] / (float)0x40;
+                    jar_xm_CLAMP(v);
+                    ch->volume = v;					
+                }
+            }
             break;
 
         case 29: /* Txy: Tremor */
@@ -1927,7 +1990,7 @@ static void jar_xm_tick(jar_xm_context_t* ctx) {
             break;
         default:
             break;
-        };
+        }
 
         float panning, volume;
         panning = ch->panning + (ch->panning_envelope_panning - .5f) * (.5f - fabs(ch->panning - .5f)) * 2.0f;
@@ -1937,16 +2000,16 @@ static void jar_xm_tick(jar_xm_context_t* ctx) {
             volume = ch->volume + ch->tremolo_volume;
             jar_xm_CLAMP(volume);
             volume *= ch->fadeout_volume * ch->volume_envelope_volume;
-        };
+        }
 
         if (mod->ramping) {
-            ch->target_panning = panning;
-            ch->target_volume = volume;
+            ch->target_volume[0] = volume * sqrt(1.f - panning);
+            ch->target_volume[1] = volume * sqrt(panning);
         } else {
-            ch->actual_panning = panning;
-            ch->actual_volume = volume;
-        };
-    };
+            ch->actual_volume[0] = volume * sqrt(1.f - panning);
+            ch->actual_volume[1] = volume * sqrt(panning);
+        }
+    }
 
     ctx->current_tick++; // ok so we understand that ticks increment within the row
     if(ctx->current_tick >= ctx->tempo + ctx->extra_ticks) {
@@ -2114,32 +2177,43 @@ static void jar_xm_mixdown(jar_xm_context_t* ctx, float* left, float* right) {
     *right = 0.f;
     if(ctx->max_loop_count > 0 && ctx->loop_count > ctx->max_loop_count) { return; }
 
-    for(uint8_t i = 0; i < ctx->module.num_channels; ++i) {
+    for(uint8_t i = 0; i < mod->num_channels; ++i) {
         jar_xm_channel_context_t* ch = ctx->channels + i;
         if(ch->instrument != NULL && ch->sample != NULL && ch->sample_position >= 0) {
             jar_xm_next_of_sample(ctx, ch, -1);
             if(!ch->muted && !ch->instrument->muted) {
-                *left  += ch->curr_left * ch->actual_volume * (1.f - ch->actual_panning);
-                *right += ch->curr_right * ch->actual_volume * ch->actual_panning;
+
+                float ch_left =  ((ch->curr_left * ch->actual_volume[0])  * ctx->channel_volume[i]);
+                float ch_right = ((ch->curr_right * ch->actual_volume[1]) * ctx->channel_volume[i]);
+                if(ch_left < -1.0)  {ch_left = -1.0;}  else if(ch_left > 1.0)  {ch_left = 1.0;};
+                if(ch_right < -1.0) {ch_right = -1.0;} else if(ch_right > 1.0) {ch_right = 1.0;};   
+                *left  += ch_left;
+                *right += ch_right;
             };
 
             if (mod->ramping) {
                 ch->frame_count++;
-                jar_xm_SLIDE_TOWARDS(ch->actual_volume, ch->target_volume, ctx->volume_ramp);
-                jar_xm_SLIDE_TOWARDS(ch->actual_panning, ch->target_panning, ctx->panning_ramp);
+                jar_xm_SLIDE_TOWARDS(ch->actual_volume[0], ch->target_volume[0], ctx->volume_ramp);
+                jar_xm_SLIDE_TOWARDS(ch->actual_volume[1], ch->target_volume[1], ctx->volume_ramp);
             };
         };
     };
-    if (ctx->global_volume != 1.0f) {
-        *left *= ctx->global_volume;
-        *right *= ctx->global_volume;
-    };
 
-    // experimental
-//    float counter = (float)ctx->generated_samples * 0.0001f
-//    *left = tan(&left + sin(counter));
-//    *right = tan(&right + cos(counter));
-
+    if (mod->comp_exp) {
+        if (ctx->global_volume != 1.0f) {
+            *left = (*left * jar_xm_compress_expand(*left)) * ctx->global_volume;
+            *right = (*right * jar_xm_compress_expand(*right)) * ctx->global_volume;
+        } else {
+            *left += jar_xm_compress_expand(*left);
+            *right += jar_xm_compress_expand(*right);
+        }
+    } else {
+        if (ctx->global_volume != 1.0f) {
+            *left *= ctx->global_volume;
+            *right *= ctx->global_volume;
+        }
+    };    
+    
     // apply brick wall limiter when audio goes beyond bounderies
     if(*left < -1.0)  {*left = -1.0;}  else if(*left > 1.0)  {*left = 1.0;};
     if(*right < -1.0) {*right = -1.0;} else if(*right > 1.0) {*right = 1.0;};   
@@ -2155,6 +2229,7 @@ void jar_xm_generate_samples(jar_xm_context_t* ctx, float* output, size_t numsam
 };
 
 uint64_t jar_xm_get_remaining_samples(jar_xm_context_t* ctx) {
+    /*
     uint64_t total = 0;
     uint8_t currentLoopCount = jar_xm_get_loop_count(ctx);
     jar_xm_set_max_loop_count(ctx, 0);
@@ -2164,7 +2239,9 @@ uint64_t jar_xm_get_remaining_samples(jar_xm_context_t* ctx) {
         jar_xm_tick(ctx);
     }
     ctx->loop_count = currentLoopCount;
-    return total;
+    
+    return total;*/
+    return 2147483647; // no end of loop
 }
 
 //--------------------------------------------
@@ -2248,9 +2325,10 @@ int jar_xm_create_context_from_file(jar_xm_context_t** ctx, uint32_t rate, const
     return 0;
 }
 
+
 // not part of the original library
 void jar_xm_reset(jar_xm_context_t* ctx) {
-    for (uint16_t i = 0; i < jar_xm_get_number_of_channels(ctx); i++) {
+    for (uint8_t i = 0; i < ctx->module.num_channels; i++) {
         jar_xm_cut_note(&ctx->channels[i]);
     }
     ctx->current_row = 0;
@@ -2270,24 +2348,80 @@ void jar_xm_flip_linear_interpolation(jar_xm_context_t* ctx) {
     }
 }
 
-void jar_xm_table_jump(jar_xm_context_t* ctx, int table_ptr) {
-    for (uint16_t i = 0; i < jar_xm_get_number_of_channels(ctx); i++) {
-        jar_xm_cut_note(&ctx->channels[i]);
-    }
-    ctx->current_row = 0;
-    ctx->current_tick = 0;
-    if(table_ptr > 0 && table_ptr < ctx->module.length) {
-        ctx->current_table_index = table_ptr;
-        ctx->module.restart_position = table_ptr; // The reason to jump is to start a new loop or track
+void jar_xm_flip_ramping(jar_xm_context_t* ctx) {
+    if (ctx->module.ramping) {
+        ctx->module.ramping = 0;
     } else {
-        ctx->current_table_index = 0;
-        ctx->module.restart_position = 0; // The reason to jump is to start a new loop or track
+        ctx->module.ramping = 1;
+    }
+}
+
+void jar_xm_flip_comp_exp(jar_xm_context_t* ctx) {
+    if (ctx->module.comp_exp) {
+        ctx->module.comp_exp = 0;
+    } else {
+        ctx->module.comp_exp = 1;
+    }
+}
+
+void jar_xm_pattern_jump(jar_xm_context_t* ctx, int table_ptr) {
+    if(table_ptr > 0 && table_ptr < ctx->module.length) {
+        ctx->jump_dest = table_ptr; // The reason to jump is to start a new loop or track
+    } else {
+        ctx->jump_dest = 0;
         ctx->tempo =ctx->default_tempo; // reset to file default value 
         ctx->bpm = ctx->default_bpm; // reset to file default value
         ctx->global_volume = ctx->default_global_volume; // reset to file default value
     };
 }
 
+void jar_xm_pattern_jump_immediate(jar_xm_context_t* ctx, int table_ptr, bool pattern_break) {
+
+    if (pattern_break) {
+        for (uint8_t i = 0; i < ctx->module.num_channels; i++) {
+            jar_xm_cut_note(&ctx->channels[i]);
+        }
+        ctx->current_row = 0;
+        ctx->current_tick = 0;
+    };
+    if(table_ptr > 0 && table_ptr < ctx->module.length) {
+        ctx->current_table_index = table_ptr;
+    } else {
+        ctx->current_table_index = 0;
+        ctx->tempo =ctx->default_tempo; // reset to file default value 
+        ctx->bpm = ctx->default_bpm; // reset to file default value
+        ctx->global_volume = ctx->default_global_volume; // reset to file default value
+    };
+}
+
+void jar_xm_set_channel_volume(jar_xm_context_t* ctx, int channel, int amount) {
+    float volume = (float)amount / 255.0f;
+    if (volume <0.0) { volume = 0.0;} else if (volume >1.0) { volume = 1.0;};
+    ctx->channel_volume[channel] = volume;    
+}
+
+void jar_xm_change_channel_volume(jar_xm_context_t* ctx, int channel, int amount) {
+    float volume = (float)ctx->channel_volume[channel] + (float)amount / 255.0f;
+    if (volume <0.0) { volume = 0.0;} else if (volume >1.0) { volume = 1.0;};
+    ctx->channel_volume[channel] = volume;
+}
+
+void jar_xm_set_all_channel_volumes(jar_xm_context_t* ctx, int amount) {
+    float volume = (float)amount / 255.0f;
+    if (volume <0.0) { volume = 0.0;} else if (volume >1.0) { volume = 1.0;};
+    for (uint8_t i = 0; i < ctx->module.num_channels; i++) {
+        ctx->channel_volume[i] = volume;
+    };
+}
+
+void jar_xm_change_all_channel_volumes(jar_xm_context_t* ctx, int amount) {
+    float volume;
+    for (uint8_t i = 0; i < ctx->module.num_channels; i++) {
+        volume = ctx->channel_volume[i] + (float)amount / 255.0f;
+        if (volume <0.0) { volume = 0.0;} else if (volume >1.0) { volume = 1.0;};
+        ctx->channel_volume[i] = volume;
+    };
+}
 
 // TRANSLATE NOTE NUMBER INTO USER VALUE (ie. 1 = C-1, 2 = C#1, 3 = D-1 ... )
 const char* xm_note_chr(int number) {
@@ -2307,18 +2441,20 @@ const char* xm_note_chr(int number) {
     case 9: return "G#";
     case 10: return "A-";
     case 11: return "A#";
+    case 0:
     case 12: return "B-";
+    default: return "??"; /* UNKNOWN */
     };
-    return "??";
-};
+}
 
 const char* xm_octave_chr(int number) {
     if (number == NOTE_OFF) {
         return "=";
     };
-
-    int number2 = number - number % 12;
-    int result = floor(number2 / 12) + 1;
+    int number3 = number % 12;
+    int number2 = number - number3;
+    int result = floor(number2 / 12);
+    if (number3 > 0) {result += 1;};
     switch(result) {
     case 1: return "1";
     case 2: return "2";
@@ -2328,10 +2464,10 @@ const char* xm_octave_chr(int number) {
     case 6: return "6";
     case 7: return "7";
     case 8: return "8";
-    default: return "?"; /* UNKNOWN */
+    default: return "?";
     };
 
-};
+}
 
 // TRANSLATE NOTE EFFECT CODE INTO USER VALUE
 const char* xm_effect_chr(int fx) {
@@ -2354,11 +2490,13 @@ const char* xm_effect_chr(int fx) {
     case 0xF: return "F";/* Fxx: Set tempo/BPM */
     case 16: return "G"; /* Gxx: Set global volume */
     case 17: return "H"; /* Hxy: Global volume slide */
+    case 20: return "K"; /* Kxy: Key Off */
     case 21: return "L"; /* Lxx: Set envelope position */
     case 25: return "P"; /* Pxy: Panning slide */
     case 27: return "R"; /* Rxy: Multi retrig note */
     case 29: return "T"; /* Txy: Tremor */
     case 33: return "X"; /* Xxy: Extra stuff */
+    case 34: return "Y"; /* Yxy: Panbello */    
     default: return "?"; /* UNKNOWN */
     };
 }
@@ -2377,56 +2515,63 @@ void jar_xm_debug(jar_xm_context_t *ctx) {
     y += size; DrawText(TextFormat("POS JMP = %d", ctx->position_jump),             x, y, size, WHITE);
     y += size; DrawText(TextFormat("JMP DST = %i", ctx->jump_dest),                 x, y, size, WHITE);
     y += size; DrawText(TextFormat("PTN BRK = %d", ctx->pattern_break),             x, y, size, WHITE);
+
+    x = size * 12; y = 0;
     y += size; DrawText(TextFormat("CUR ROW = %i", ctx->current_row),               x, y, size, WHITE);
     y += size; DrawText(TextFormat("JMP ROW = %i", ctx->jump_row),                  x, y, size, WHITE);
     y += size; DrawText(TextFormat("ROW LCT = %i", ctx->row_loop_count),            x, y, size, WHITE);
     y += size; DrawText(TextFormat("LCT     = %i", ctx->loop_count),                x, y, size, WHITE);
     y += size; DrawText(TextFormat("MAX LCT = %i", ctx->max_loop_count),            x, y, size, WHITE);
-    x = size * 12; y = 0;
     
+    x = size * 24; y = 0;
     y += size; DrawText(TextFormat("CUR TCK = %i", ctx->current_tick),              x, y, size, WHITE);
     y += size; DrawText(TextFormat("XTR TCK = %i", ctx->extra_ticks),               x, y, size, WHITE);
     y += size; DrawText(TextFormat("TCK/ROW = %i", ctx->tempo),                     x, y, size, ORANGE);
     y += size; DrawText(TextFormat("SPL TCK = %f", ctx->remaining_samples_in_tick), x, y, size, WHITE);
     y += size; DrawText(TextFormat("GEN SPL = %i", ctx->generated_samples),         x, y, size, WHITE);
-    y += size * 7;
-    
-    x = 0;
+
+    y += size * 2;
     size=16;
     // TIMELINE OF MODULE
+    DrawRectangle(size * 1.5f, y, size * 1.5f * ctx->module.length, size, ORANGE); 
     for (int i=0; i < ctx->module.length; i++) {
         if (i == ctx->jump_dest) {
             if (ctx->position_jump) {
-                DrawRectangle(i * size * 2, y - size, size * 2, size, GOLD); 
+                DrawRectangle(i * size * 1.5f, y - size, size * 1.5f, size, GOLD); 
             } else {
-                DrawRectangle(i * size * 2, y - size, size * 2, size, BROWN);                 
+                DrawRectangle(i * size * 1.5f, y - size, size * 1.5f, size, BROWN);                 
             };
         };
         if (i == ctx->current_table_index) {
-//            DrawText(TextFormat("%02X", ctx->current_tick), i * size * 2, y - size, size, WHITE);
-            DrawRectangle(i * size * 2, y, size * 2, size, RED); 
-            DrawText(TextFormat("%02X", ctx->current_row), i * size * 2, y - size, size, YELLOW);
-        } else {
-            DrawRectangle(i * size * 2, y, size * 2, size, ORANGE); 
+            DrawRectangle(i * size * 1.5f, y, size * 1.5f, size, RED); 
+            DrawText(TextFormat("%02X", ctx->current_row), i * size * 1.5f, y - size, size, YELLOW);
         };
-        DrawText(TextFormat("%02X", ctx->module.pattern_table[i]), i * size * 2, y, size, WHITE);
+        DrawText(TextFormat("%02X", ctx->module.pattern_table[i]), i * size * 1.5f, y, size, WHITE);
     };
     y += size;
 
     jar_xm_pattern_t* cur = ctx->module.patterns + ctx->module.pattern_table[ctx->current_table_index];
 
-    /* DISPLAY CURRENTLY PLAYING PATTERN */
+    int x_ch = size * 8;
+    // DISPLAY CHANNEL MIXING
+    x = size * 2;
+    for (uint8_t i = 0; i < ctx->module.num_channels; i++) {
+        DrawText(TextFormat("CH %02X", i), x, y, size, WHITE);
+        DrawText(TextFormat("%f", ctx->channel_volume[i]), x, y + size, size, WHITE);
+        x += x_ch;
+    };
 
-    x += 2 * size;
+    // DISPLAY CURRENTLY PLAYING PATTERN
+    y += size * 2;
+    x = size * 2;
+    DrawRectangle(x, y, 8 * size * (ctx->module.num_channels), size, PURPLE);
     for(uint8_t i = 0; i < ctx->module.num_channels; i++) {
-        DrawRectangle(x, y, 8 * size, size, PURPLE);
         DrawText("N", x, y, size, YELLOW);
         DrawText("I", x + size * 2, y, size, YELLOW);
         DrawText("V", x + size * 4, y, size, YELLOW);
         DrawText("FX", x + size * 6, y, size, YELLOW);
-        x += 9 * size;
+        x += x_ch;
     };
-    x += size;   
     for (int j=(ctx->current_row - 14); j<(ctx->current_row + 15); j++) {
         y += size;
         x = 0;
@@ -2434,12 +2579,12 @@ void jar_xm_debug(jar_xm_context_t *ctx) {
             DrawRectangle(x, y, size * 2, size, BROWN); 
             DrawText(TextFormat("%02X",j), x, y, size, WHITE);
             x += 2 * size;
+            if (j==(ctx->current_row)) {
+                DrawRectangle(x, y, 8 * size * (ctx->module.num_channels), size, DARKGREEN); 
+            } else {
+                DrawRectangle(x, y, 8 * size * (ctx->module.num_channels), size, DARKGRAY); 
+            };
             for(uint8_t i = 0; i < ctx->module.num_channels; i++) {
-                if (j==(ctx->current_row)) {
-                    DrawRectangle(x, y, 8 * size, size, DARKGREEN); 
-                } else {
-                    DrawRectangle(x, y, 8 * size, size, DARKGRAY); 
-                };
                 jar_xm_pattern_slot_t *s = cur->slots + j * ctx->module.num_channels + i;
            //     jar_xm_channel_context_t *ch = ctx->channels + i;
                 if (s->note > 0) {DrawText(TextFormat("%s%s", xm_note_chr(s->note), xm_octave_chr(s->note) ), x, y, size, WHITE);} else {DrawText("...", x, y, size, GRAY);};
@@ -2448,15 +2593,10 @@ void jar_xm_debug(jar_xm_context_t *ctx) {
                     if (s->volume_column == 0) {
                         DrawText(TextFormat("%02X", 64), x + size * 4, y, size, YELLOW);
                     };
-                } else {
-                    DrawText("..", x + size * 2, y, size, GRAY);
-                    if (s->volume_column == 0) {
-                        DrawText("..", x + size * 4, y, size, GRAY);
-                    };
                 };
                 if (s->volume_column > 0) {DrawText(TextFormat("%02X", (s->volume_column - 16)), x + size * 4, y, size, WHITE);};
                 if (s->effect_type > 0 || s->effect_param > 0) {DrawText(TextFormat("%s%02X", xm_effect_chr(s->effect_type), s->effect_param), x + size * 6, y, size, WHITE);};
-                x += 9 * size;
+                x += x_ch;
             };
         };
     };
