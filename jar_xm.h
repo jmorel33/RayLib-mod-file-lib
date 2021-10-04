@@ -267,6 +267,7 @@ extern int __fail[-1];
 
 /* ----- XM constants ----- */
 #define SAMPLE_NAME_LENGTH 22
+#define INSTRUMENT_HEADER_LENGTH 263
 #define INSTRUMENT_NAME_LENGTH 22
 #define MODULE_NAME_LENGTH 20
 #define TRACKER_NAME_LENGTH 20
@@ -360,7 +361,7 @@ struct jar_xm_sample_s {
  struct jar_xm_pattern_slot_s {
      uint8_t note; /* 1-96, 97 = Key Off note */
      uint8_t instrument; /* 1-128 */
-     uint8_t volume_column;
+     uint8_t volume_column; /* 1-64 */
      uint8_t effect_type;
      uint8_t effect_param;
  };
@@ -462,7 +463,6 @@ struct jar_xm_sample_s {
      float curr_left;
      float curr_right;
 
-     float actual_panning;
      float actual_volume[2];
  };
  typedef struct jar_xm_channel_context_s jar_xm_channel_context_t;
@@ -736,6 +736,7 @@ uint16_t jar_xm_get_instrument_of_channel(jar_xm_context_t* ctx, uint16_t chn) {
 #define READ_U16(offset) ((uint16_t)READ_U8(offset) | ((uint16_t)READ_U8((offset) + 1) << 8))
 #define READ_U32(offset) ((uint32_t)READ_U16(offset) | ((uint32_t)READ_U16((offset) + 2) << 16))
 #define READ_MEMCPY(ptr, offset, length) memcpy_pad(ptr, length, moddata, moddata_length, offset)
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
 
 static void memcpy_pad(void *dst, size_t dst_len, const void *src, size_t src_len, size_t offset) {
     uint8_t *dst_c = dst;
@@ -816,7 +817,12 @@ size_t jar_xm_get_memory_needed_for_context(const char* moddata, size_t moddata_
         memory_needed += num_samples * sizeof(jar_xm_sample_t);
         if(num_samples > 0) { sample_header_size = READ_U32(offset + 29); }
 
-        offset += READ_U32(offset);  /* Instrument header size */
+		/* Instrument header size */
+		uint32_t ins_header_size = READ_U32(offset);
+		if (ins_header_size == 0 || ins_header_size > INSTRUMENT_HEADER_LENGTH)
+			ins_header_size = INSTRUMENT_HEADER_LENGTH;
+		offset += ins_header_size;
+        
         for(uint16_t j = 0; j < num_samples; ++j) {
             uint32_t sample_size;
             uint8_t flags;
@@ -971,6 +977,16 @@ char* jar_xm_load_module(jar_xm_context_t* ctx, const char* moddata, size_t modd
             instr->panning_envelope.loop_start_point = READ_U8(offset + 231);
             instr->panning_envelope.loop_end_point = READ_U8(offset + 232);
 
+			// Fix broken modules with loop points outside of defined points
+			if (instr->volume_envelope.num_points > 0) {
+				instr->volume_envelope.loop_start_point =   MIN(instr->volume_envelope.loop_start_point, instr->volume_envelope.num_points - 1);
+				instr->volume_envelope.loop_end_point =     MIN(instr->volume_envelope.loop_end_point,   instr->volume_envelope.num_points - 1);
+			}
+			if (instr->panning_envelope.num_points > 0) {
+				instr->panning_envelope.loop_start_point =  MIN(instr->panning_envelope.loop_start_point, instr->panning_envelope.num_points - 1);
+				instr->panning_envelope.loop_end_point =    MIN(instr->panning_envelope.loop_end_point,   instr->panning_envelope.num_points - 1);
+			}
+
             uint8_t flags = READ_U8(offset + 233);
             instr->volume_envelope.enabled = flags & (1 << 0);
             instr->volume_envelope.sustain_enabled = flags & (1 << 1);
@@ -1016,6 +1032,7 @@ char* jar_xm_load_module(jar_xm_context_t* ctx, const char* moddata, size_t modd
             case 2:
             case 3:
                 sample->loop_type = jar_xm_PING_PONG_LOOP;
+                break;
             case 1:
                 sample->loop_type = jar_xm_FORWARD_LOOP;
                 break;
@@ -1023,11 +1040,19 @@ char* jar_xm_load_module(jar_xm_context_t* ctx, const char* moddata, size_t modd
                 sample->loop_type = jar_xm_NO_LOOP;
                 break;
             };
+
+			/* Fix invalid loop definitions */
+			if (sample->loop_start > sample->length)    sample->loop_start = sample->length;
+			if (sample->loop_end > sample->length)      sample->loop_end = sample->length;
+			sample->loop_length = sample->loop_end - sample->loop_start;
+            if (sample->loop_length == 0) sample->loop_type = jar_xm_NO_LOOP;
+
             sample->bits = (flags & 0x10) ? 16 : 8;
             sample->stereo = (flags & 0x20) ? 1 : 0;
             sample->panning = (float)READ_U8(offset + 15) / 255.f;
             sample->relative_note = (int8_t)READ_U8(offset + 16);
-            READ_MEMCPY(sample->name, 18, SAMPLE_NAME_LENGTH);
+            READ_MEMCPY(sample->name, offset + 18, SAMPLE_NAME_LENGTH);
+            sample->name[SAMPLE_NAME_LENGTH] = 0;
             sample->data = (float*)mempool;
             if(sample->bits == 16) {
                 /* 16 bit sample */
@@ -1206,14 +1231,14 @@ static void jar_xm_autovibrato(jar_xm_context_t* ctx, jar_xm_channel_context_t* 
 }
 
 static void jar_xm_vibrato(jar_xm_context_t* ctx, jar_xm_channel_context_t* ch, uint8_t param) {
-    ch->vibrato_ticks += (param >> 4);
-    ch->vibrato_note_offset = -2.f * jar_xm_waveform(ch->vibrato_waveform, ch->vibrato_ticks) * (float)(param & 0x0F) / (float)0xF;
-    jar_xm_update_frequency(ctx, ch);
+	ch->vibrato_ticks += (param >> 4);
+	ch->vibrato_note_offset = -2.f * jar_xm_waveform(ch->vibrato_waveform, ch->vibrato_ticks) * (float)(param & 0x0F) / (float)0xF;
+	jar_xm_update_frequency(ctx, ch);
 }
 
 static void jar_xm_tremolo(jar_xm_context_t* ctx, jar_xm_channel_context_t* ch, uint8_t param, uint16_t pos) {
-    unsigned int step = pos * (param >> 4);
-    ch->tremolo_volume = -1.f * jar_xm_waveform(ch->tremolo_waveform, step) * (float)(param & 0x0F) / (float)0xF;
+	unsigned int step = pos * (param >> 4);
+	ch->tremolo_volume = -1.f * jar_xm_waveform(ch->tremolo_waveform, step) * (float)(param & 0x0F) / (float)0xF;
 }
 
 static void jar_xm_arpeggio(jar_xm_context_t* ctx, jar_xm_channel_context_t* ch, uint8_t param, uint16_t tick) {
@@ -1360,7 +1385,7 @@ static float jar_xm_frequency(jar_xm_context_t* ctx, float period, float note_of
         }
         if(JAR_XM_DEBUG && (p1 < period || p2 > period)) { DEBUG("%i <= %f <= %i should hold but doesn't, this is a bug", p2, period, p1); }
         note = 12.f * (octave + 2) + a + jar_xm_INVERSE_LERP(p1, p2, period);
-        return jar_xm_amiga_frequency(jar_xm_amiga_period(note + note_offset + 16.f * period_offset));
+        return jar_xm_amiga_frequency(jar_xm_amiga_period(note + note_offset) + 16.f * period_offset);
     }
 
     return .0f;
@@ -1433,7 +1458,7 @@ static void jar_xm_handle_note_and_instrument(jar_xm_context_t* ctx, jar_xm_chan
         break;
     case 4: /* 4xy: Vibrato */
         if(s->effect_param & 0x0F) { ch->vibrato_param = (ch->vibrato_param & 0xF0) | (s->effect_param & 0x0F); }  /* Set vibrato depth */
-        if(s->effect_param >> 4) { ch->vibrato_param = (s->effect_param & 0xF0) | (ch->vibrato_param & 0x0F); }   /* Set vibrato speed */
+        if(s->effect_param & 0xF0) { ch->vibrato_param = (ch->vibrato_param & 0x0F) | (s->effect_param & 0xF0); }   /* Set vibrato speed */
         break;
     case 5: /* 5xy: Tone portamento + Volume slide */
         if(s->effect_param > 0) {  ch->volume_slide_param = s->effect_param; }
@@ -1443,7 +1468,7 @@ static void jar_xm_handle_note_and_instrument(jar_xm_context_t* ctx, jar_xm_chan
         break;
     case 7: /* 7xy: Tremolo */
         if(s->effect_param & 0x0F) { ch->tremolo_param = (ch->tremolo_param & 0xF0) | (s->effect_param & 0x0F); } /* Set tremolo depth */
-        if(s->effect_param >> 4) { ch->tremolo_param = (s->effect_param & 0xF0) | (ch->tremolo_param & 0x0F); }  /* Set tremolo speed */
+        if(s->effect_param & 0xF0) { ch->tremolo_param = (ch->tremolo_param & 0x0F) | (s->effect_param & 0xF0); }  /* Set tremolo speed */
         break;
     case 8: /* 8xx: Set panning */
         ch->panning = (float)s->effect_param / 255.f;
@@ -1802,7 +1827,7 @@ static void jar_xm_tick(jar_xm_context_t* ctx) {
         // Effects in volumne column mostly handled on a per tick basis
         switch(ch->current->volume_column & 0xF0) {
         case 0x50: // Checks for volume = 64
-            if(ch->current->volume_column != 0x50) break;
+            if(ch->current->volume_column > 0x50) break; // invalid volume setting ( > 64)
         case 0x10: // Set volume 0-15
         case 0x20: // Set volume 16-32
         case 0x30: // Set volume 32-48
@@ -1962,7 +1987,7 @@ static void jar_xm_tick(jar_xm_context_t* ctx) {
             break;
 
         case 20: /* Kxx: Key off */
-            if(ctx->current_tick == ch->current->effect_param) {     jar_xm_key_off(ch); };
+            if(ctx->current_tick == ch->current->effect_param) jar_xm_key_off(ch);
             break;
         case 21: /* Lxx: Set envelope position */
             break;        
